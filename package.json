@@ -1,0 +1,39 @@
+{
+  "name": "pdfops-sdk",
+  "version": "0.3.0",
+  "description": "Typed client for the PDFops API \u2014 deterministic PDF fill, merge, and inspect over HTTP. Edge-safe: works in Cloudflare Workers, Vercel Edge, Deno, Bun, Node 18+, and browsers.",
+  "keywords": [
+    "pdf",
+    "acroform",
+    "fill-pdf",
+    "merge-pdf",
+    "pdf-api",
+    "edge",
+    "cloudflare-workers",
+    "vercel-edge",
+    "serverless"
+  ],
+  "homepage": "https://pdfops.dev",
+  "bugs": "mailto:hello@pdfops.dev",
+  "author": "PDFops <hello@pdfops.dev> (https://pdfops.dev)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  }
+}
