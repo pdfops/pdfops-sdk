@@ -29,12 +29,16 @@ export interface InspectedField {
   value?: string;
   checked?: boolean;
   options?: string[];
+  /** Text fields only: values longer than this are rejected with exceeds_max_length. */
+  maxLength?: number;
   readOnly: boolean;
   raw?: string;
 }
 
 export interface InspectResult {
   count: number;
+  /** Hybrid AcroForm/XFA input: fillForm() writes the AcroForm layer and drops the XFA layer on save. */
+  hasXFA: boolean;
   fields: InspectedField[];
   /** Paste-ready `fields` object for fillForm(). */
   fillTemplate: Record<string, string>;
@@ -141,14 +145,18 @@ export class PdfOps {
    * Field names must exist in the PDF — use inspect() to discover them.
    * Checkbox values are the strings "true" | "false"; choice fields
    * take one of their options.
+   * Pass { flatten: true } to bake values into page content and drop
+   * the AcroForm so fields are no longer interactive.
    */
   async fillForm(
     pdf: PdfInput,
     fields: Record<string, string>,
+    opts?: { flatten?: boolean },
   ): Promise<Uint8Array> {
     const fd = new FormData();
     fd.append('pdf', toBlob(pdf), 'input.pdf');
     fd.append('fields', JSON.stringify(fields));
+    if (opts?.flatten) fd.append('flatten', 'true');
     const res = await this.request('/api/fill-form', {
       method: 'POST',
       headers: this.headers(),

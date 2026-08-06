@@ -44,7 +44,9 @@ const pdf = await pdfops.invoice({
 
 Deterministic: the same request returns **byte-identical** bytes — safe to re-render idempotently from webhooks and crons. Free-tier output carries a small pdfops.dev footer; paid tiers render clean.
 
-`fillForm`/`merge` return `Uint8Array` PDF bytes — hand them to R2/S3/Blob storage, a `Response`, or an email attachment as-is.
+`fillForm`/`merge` return `Uint8Array` PDF bytes — hand them to R2/S3/Blob storage, a `Response`, or an email attachment as-is. `fillForm(pdf, fields, { flatten: true })` bakes the values in and drops the AcroForm so fields are no longer editable.
+
+`inspect()` also reports each text field's `maxLength` (over-length values are rejected with `exceeds_max_length`) and a top-level `hasXFA` flag — hybrid AcroForm/XFA forms (all current IRS forms) lose their XFA layer on fill, which is fine in every mainstream viewer. Encrypted PDFs are rejected with `encrypted_pdf` and decrypt advice — many government blanks ship encrypted with an empty user password; `qpdf --decrypt` unlocks them.
 
 ## API keys
 
