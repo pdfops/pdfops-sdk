@@ -15,10 +15,20 @@ export interface PdfOpsOptions {
   /**
    * Integration identifier sent as X-Pdfops-Client (e.g. "mcp", "n8n").
    * Used only for anonymous usage attribution — set it when embedding
-   * this SDK inside another tool.
+   * this SDK inside another tool. Default: "sdk".
    */
   clientTag?: string;
+  /**
+   * Version of the embedding integration, sent as X-Pdfops-Client-Version.
+   * Default: this SDK's own version when clientTag is omitted, else unset.
+   */
+  clientVersion?: string;
+  /** Host application identity, sent as X-Pdfops-Client-Host (e.g. "claude-ai/0.1.0"). */
+  clientHost?: string;
 }
+
+/** This package's version — keep in step with sdk/package.json (asserted in tests). */
+export const SDK_VERSION = '0.4.1';
 
 /** Binary PDF input: any of the common runtime shapes. */
 export type PdfInput = Blob | ArrayBuffer | Uint8Array;
@@ -107,19 +117,26 @@ export class PdfOps {
   private readonly apiKey?: string;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly clientTag?: string;
+  private readonly clientTag: string;
+  private readonly clientVersion?: string;
+  private readonly clientHost?: string;
 
   constructor(options: PdfOpsOptions = {}) {
     this.apiKey = options.apiKey;
     this.baseUrl = (options.baseUrl ?? 'https://pdfops.dev').replace(/\/$/, '');
     this.fetchImpl = options.fetch ?? fetch;
-    this.clientTag = options.clientTag;
+    this.clientTag = options.clientTag ?? 'sdk';
+    this.clientVersion =
+      options.clientVersion ?? (options.clientTag ? undefined : SDK_VERSION);
+    this.clientHost = options.clientHost;
   }
 
   private headers(): Record<string, string> {
     const h: Record<string, string> = {};
     if (this.apiKey) h['X-API-Key'] = this.apiKey;
-    if (this.clientTag) h['X-Pdfops-Client'] = this.clientTag;
+    h['X-Pdfops-Client'] = this.clientTag;
+    if (this.clientVersion) h['X-Pdfops-Client-Version'] = this.clientVersion;
+    if (this.clientHost) h['X-Pdfops-Client-Host'] = this.clientHost;
     return h;
   }
 
