@@ -28,7 +28,7 @@ export interface PdfOpsOptions {
 }
 
 /** This package's version — keep in step with sdk/package.json (asserted in tests). */
-export const SDK_VERSION = '0.4.1';
+export const SDK_VERSION = '0.4.2';
 
 /** Binary PDF input: any of the common runtime shapes. */
 export type PdfInput = Blob | ArrayBuffer | Uint8Array;
@@ -49,6 +49,8 @@ export interface InspectResult {
   count: number;
   /** Hybrid AcroForm/XFA input: fillForm() writes the AcroForm layer and drops the XFA layer on save. */
   hasXFA: boolean;
+  /** The form exceeded an API enumeration cap: `fields` is a prefix, not the full list. */
+  truncated: boolean;
   fields: InspectedField[];
   /** Paste-ready `fields` object for fillForm(). */
   fillTemplate: Record<string, string>;
@@ -71,7 +73,7 @@ export interface InvoiceRequest {
   to: string | InvoiceParty;
   items: InvoiceItem[];
   invoice_number?: string;
-  /** Shown verbatim; also pins the PDF's metadata dates (determinism). */
+  /** Calendar date, strictly `YYYY-MM-DD` (else 400 `invalid_date`). Shown verbatim; also pins the PDF's metadata dates (determinism). */
   date?: string;
   due?: string;
   /** ISO 4217 code. Default "USD". */
