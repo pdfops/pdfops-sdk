@@ -1,6 +1,6 @@
 # pdfops-sdk
 
-Typed client for the [PDFops API](https://pdfops.dev) — deterministic PDF **fill**, **merge**, and **inspect** over HTTP. No Chromium, no native deps, no infrastructure.
+Typed client for the [PDFops API](https://pdfops.dev) — deterministic PDF **fill**, **merge**, and **inspect** over HTTP, plus page operations (extract, delete, rotate, split, watermark, page numbers), unlock/protect, and metadata. No Chromium, no native deps, no infrastructure.
 
 Edge-safe by construction: the client uses only `fetch`/`FormData`/`Blob`, so the same build runs in **Cloudflare Workers, Vercel Edge, Deno, Bun, Node 18+, and browsers**.
 
@@ -47,6 +47,21 @@ Deterministic: the same request returns **byte-identical** bytes — safe to re-
 `fillForm`/`merge` return `Uint8Array` PDF bytes — hand them to R2/S3/Blob storage, a `Response`, or an email attachment as-is. `fillForm(pdf, fields, { flatten: true })` bakes the values in and drops the AcroForm so fields are no longer editable.
 
 `inspect()` also reports each text field's `maxLength` (over-length values are rejected with `exceeds_max_length`) and a top-level `hasXFA` flag — hybrid AcroForm/XFA forms (all current IRS forms) lose their XFA layer on fill, which is fine in every mainstream viewer. Encrypted PDFs are rejected with `encrypted_pdf` and decrypt advice — many government blanks ship encrypted with an empty user password; `qpdf --decrypt` unlocks them.
+
+## Page, security and metadata operations
+
+All return `Uint8Array` PDF bytes unless noted; `opts.password` opens a user-password-encrypted input. Page specs are 1-based, e.g. `"1-3,5,8-"`.
+
+- `extractPages(pdf, '1-3,5')` keeps only those pages, in that order (also reorders and duplicates).
+- `deletePages(pdf, '2,4-6')` removes those pages (`no_pages_left` if none remain).
+- `rotate(pdf, 90, { pages: '1-2' })` rotates clockwise by 90, 180, 270 or -90; omit `pages` for all.
+- `split(pdf, { ranges: '1-2,3-5' })` or `split(pdf, { every: 2 })` returns `{ count, parts: [{ pages, page_count, pdf }] }` with each part decoded to bytes.
+- `watermark(pdf, 'DRAFT', { opacity: 0.2, position: 'center' })` stamps diagonal text (standard Helvetica characters only).
+- `pageNumbers(pdf, { format: 'Page {n} of {total}', position: 'bottom-right', start: 1 })` prints page numbers.
+- `unlock(pdf, password?)` returns `{ pdf, note? }`: the PDF re-saved without encryption (`note` is `"not-encrypted"` if it had none). It does not crack unknown passwords (`encrypted_pdf`).
+- `protect(pdf, { userPassword, ownerPassword, permissions: ['print'] })` encrypts; `permissions` lists what stays allowed, `[]` allows none.
+- `metadata(pdf)` returns page count, per-page sizes, title/author/dates, encryption flag and form field count as JSON.
+- `setMetadata(pdf, { title, author, subject, creator, keywords: ['a', 'b'] })` writes document info fields.
 
 ## API keys
 
