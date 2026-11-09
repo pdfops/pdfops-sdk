@@ -28,7 +28,7 @@ export interface PdfOpsOptions {
 }
 
 /** This package's version — keep in step with sdk/package.json (asserted in tests). */
-export const SDK_VERSION = '0.5.0';
+export const SDK_VERSION = '0.6.0';
 
 /** Binary PDF input: any of the common runtime shapes. */
 export type PdfInput = Blob | ArrayBuffer | Uint8Array;
@@ -225,16 +225,19 @@ export class PdfOps {
    * take one of their options.
    * Pass { flatten: true } to bake values into page content and drop
    * the AcroForm so fields are no longer interactive.
+   * Pass { password } to open a user-password PDF (owner-locked files with
+   * an empty user password need none).
    */
   async fillForm(
     pdf: PdfInput,
     fields: Record<string, string>,
-    opts?: { flatten?: boolean },
+    opts?: { flatten?: boolean; password?: string },
   ): Promise<Uint8Array> {
     const fd = new FormData();
     fd.append('pdf', toBlob(pdf), 'input.pdf');
     fd.append('fields', JSON.stringify(fields));
     if (opts?.flatten) fd.append('flatten', 'true');
+    if (opts?.password !== undefined) fd.append('password', opts.password);
     const res = await this.request('/api/fill-form', {
       method: 'POST',
       headers: this.headers(),
@@ -243,13 +246,17 @@ export class PdfOps {
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  /** Merge two or more PDFs, in order. Returns the combined PDF bytes. */
-  async merge(pdfs: PdfInput[]): Promise<Uint8Array> {
+  /**
+   * Merge two or more PDFs, in order. Returns the combined PDF bytes.
+   * Pass { password } to open user-password inputs; it applies to every input.
+   */
+  async merge(pdfs: PdfInput[], opts?: { password?: string }): Promise<Uint8Array> {
     if (pdfs.length < 2) {
       throw new PdfOpsError(400, 'too_few_pdfs', 'merge needs at least 2 PDFs');
     }
     const fd = new FormData();
     pdfs.forEach((p, i) => fd.append('pdf', toBlob(p), `part-${i}.pdf`));
+    if (opts?.password !== undefined) fd.append('password', opts.password);
     const res = await this.request('/api/merge', {
       method: 'POST',
       headers: this.headers(),
@@ -261,11 +268,13 @@ export class PdfOps {
   /**
    * List a PDF's AcroForm fields (names, types, options, current
    * values) plus a paste-ready fillTemplate for fillForm(). A PDF with
-   * no form returns count 0 — not an error.
+   * no form returns count 0 — not an error. Pass { password } to open a
+   * user-password PDF.
    */
-  async inspect(pdf: PdfInput): Promise<InspectResult> {
+  async inspect(pdf: PdfInput, opts?: { password?: string }): Promise<InspectResult> {
     const fd = new FormData();
     fd.append('pdf', toBlob(pdf), 'input.pdf');
+    if (opts?.password !== undefined) fd.append('password', opts.password);
     const res = await this.request('/api/inspect', {
       method: 'POST',
       headers: this.headers(),

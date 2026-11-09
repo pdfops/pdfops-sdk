@@ -1,6 +1,6 @@
 {
   "name": "pdfops-sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Typed client for the PDFops API — deterministic PDF fill, merge, and inspect over HTTP, plus page operations (extract, delete, rotate, split, watermark, page numbers), unlock/protect, and metadata. Edge-safe: works in Cloudflare Workers, Vercel Edge, Deno, Bun, Node 18+, and browsers.",
   "keywords": [
     "pdf",
