@@ -1,7 +1,7 @@
 {
   "name": "pdfops-sdk",
-  "version": "0.6.0",
-  "description": "Typed client for the PDFops API — deterministic PDF fill, merge, and inspect over HTTP, plus page operations (extract, delete, rotate, split, watermark, page numbers), unlock/protect, and metadata. Edge-safe: works in Cloudflare Workers, Vercel Edge, Deno, Bun, Node 18+, and browsers.",
+  "version": "0.7.0",
+  "description": "Typed client for the PDFops API: fill, merge and inspect PDF forms over HTTP, plus page operations, text extraction and search, stamping, HTML, Markdown and image to PDF, invoices and e-invoices. Edge-safe: works in Cloudflare Workers, Vercel Edge, Deno, Bun and Node 18+.",
   "keywords": [
     "pdf",
     "acroform",
@@ -35,6 +35,9 @@
     "dist",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\""
+  },
   "sideEffects": false,
   "engines": {
     "node": ">=18"

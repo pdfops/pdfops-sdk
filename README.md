@@ -2,7 +2,7 @@
 
 Typed client for the [PDFops API](https://pdfops.dev) — deterministic PDF **fill**, **merge**, and **inspect** over HTTP, plus page operations (extract, delete, rotate, split, watermark, page numbers), unlock/protect, and metadata. No Chromium, no native deps, no infrastructure.
 
-Edge-safe by construction: the client uses only `fetch`/`FormData`/`Blob`, so the same build runs in **Cloudflare Workers, Vercel Edge, Deno, Bun, Node 18+, and browsers**.
+Edge-safe by construction: the client uses only `fetch`/`FormData`/`Blob`, so the same build runs in **Cloudflare Workers, Vercel Edge, Deno, Bun and Node 18+**. It is a server-side client: the API does not answer cross-origin browser requests, and a key shipped in page code is public.
 
 ```bash
 npm install pdfops-sdk
@@ -63,6 +63,76 @@ All return `Uint8Array` PDF bytes unless noted; `opts.password` opens a user-pas
 - `metadata(pdf)` returns page count, per-page sizes, title/author/dates, encryption flag and form field count as JSON.
 - `setMetadata(pdf, { title, author, subject, creator, keywords: ['a', 'b'] })` writes document info fields.
 
+## Generate, read, stamp and attach
+
+Methods that return more than bytes use a result object, like `unlock()`. Headers the API sends are exposed on it.
+
+- `htmlToPdf({ html, page_size: 'a4', margin: 36 })` renders HTML in headless Chromium and returns `{ pdf, pages?, blockedRequests? }`.
+- `textToPdf({ content: '# Report', format: 'markdown', page_numbers: true })` lays out Markdown, text or CSV and returns `Uint8Array`.
+- `imageToPdf([jpg, png], { pageSize: 'a4', margin: 36 })` makes one page per image and returns `Uint8Array`.
+- `extractText(pdf, { pages: '1-3', tablesFormat: 'csv' })` returns `{ pageCount, pages, pagesWithoutText, truncated }`; each page has `text`, positioned `lines` and `tables`.
+- `extractTextPlain(pdf)` returns `{ text, truncated }`, pages separated by a form feed.
+- `extractTablesXlsx(pdf)` returns `{ xlsx, truncated, truncatedBy, cellsTruncated }`: one workbook, one sheet per table. With no tables it throws `no_tables`.
+- `findText(pdf, 'Invoice', { regex: false, caseSensitive: false, wholeWord: true, maxHits: 100 })` returns hits with page and box. When `nextPage` is not null the scan stopped early; repeat with `pages` set to the page number plus a dash, e.g. `"6-"`.
+- `edit(pdf, items, { images })` stamps text, images and barcodes. `image` items name a key of `images`; a key is 1-64 characters of letters, digits, `_`, `.` or `-`, and not `pdf`, `items` or `password` (anything else throws before sending).
+- `addFields(pdf, fields)` creates form fields and returns `{ pdf, warning? }`.
+- `attach(pdf, files)` embeds files and returns `{ pdf, attachmentKeys }`.
+
+```ts
+const { pdf, pages } = await pdfops.htmlToPdf({ html: '<h1>Hello</h1>', page_size: 'a4' });
+
+const memo = await pdfops.textToPdf({ content: '# Memo\n\nShip it.', title: 'Memo' });
+
+const scan = await pdfops.imageToPdf([photo1, photo2], { pageSize: 'a4' });
+
+const read = await pdfops.extractText(reportPdf, { pages: '1-2', tablesFormat: 'csv' });
+
+const { xlsx } = await pdfops.extractTablesXlsx(reportPdf);
+
+const { hits, nextPage } = await pdfops.findText(contractPdf, 'Termination', { wholeWord: true });
+// hits[0]: { page, text, line, x, y, width, height }
+
+const stamped = await pdfops.edit(
+  contractPdf,
+  [
+    { type: 'text', page: 1, x: 72, y: 720, text: 'APPROVED', size: 18, color: '#c00' },
+    { type: 'image', page: 1, x: 72, y: 60, width: 120, image: 'sig' },
+    { type: 'barcode', page: 1, x: 450, y: 60, format: 'qrcode', value: 'https://pdfops.dev' },
+  ],
+  { images: { sig: signaturePng } },
+);
+
+const { pdf: form } = await pdfops.addFields(blankPdf, [
+  { type: 'text', name: 'full_name', page: 1, x: 72, y: 600, width: 220, height: 20 },
+  { type: 'checkbox', name: 'agree', page: 1, x: 72, y: 560, width: 14, height: 14 },
+]);
+
+const { pdf: withXml, attachmentKeys } = await pdfops.attach(invoicePdf, [
+  { data: xmlBytes, name: 'data.xml', mimeType: 'text/xml', relationship: 'Data' },
+]);
+```
+
+## Factur-X / ZUGFeRD e-invoices
+
+Set `e_invoice: 'factur-x'` on `invoice()` to get an EN 16931 invoice PDF with the XML embedded. This mode needs structured parties (`name`, `country`, and `vat_id` for the seller), a currency, an invoice number, a date, a due date or `payment_terms`, and a unit code on every item.
+
+```ts
+const pdf = await pdfops.invoice({
+  e_invoice: 'factur-x',
+  from: { name: 'Acme GmbH', country: 'DE', street: 'Hauptstr. 1', postcode: '10115', city: 'Berlin', vat_id: 'DE123456789' },
+  to: { name: 'Globex SARL', country: 'FR', city: 'Paris' },
+  invoice_number: 'INV-0042',
+  date: '2026-11-01',
+  due: '2026-12-01',
+  currency: 'EUR',
+  tax_rate: 19,
+  iban: 'DE89370400440532013000',
+  items: [{ description: 'Consulting', quantity: 10, unit: 'HUR', unit_price: 145 }],
+});
+```
+
+`einvoice_fields_required` lists what is still missing in `e.body.missing`; `invalid_einvoice_field` and `unrenderable_text` are the other new error codes.
+
 ## API keys
 
 - **Keyless**: 100 requests / IP / month — try it without an account.
@@ -90,6 +160,8 @@ try {
   }
 }
 ```
+
+`e.body` holds the parsed JSON error body, for fields beyond `code` and details such as `missing` or `nextPage`.
 
 Common codes: `unknown_field`, `invalid_pdf`, `invalid_api_key` (401), `rate_limited` (429 — includes a `Retry-After` on the HTTP response).
 

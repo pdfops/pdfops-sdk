@@ -1,8 +1,8 @@
 // pdfops — typed client for the PDFops API (https://pdfops.dev).
 //
 // Zero dependencies. Uses only WHATWG fetch / FormData / Blob, so the
-// same build runs in Cloudflare Workers, Vercel Edge, Deno, Bun,
-// Node 18+, and browsers. Errors carry the API's structured
+// same build runs in Cloudflare Workers, Vercel Edge, Deno, Bun and
+// Node 18+. Errors carry the API's structured
 // { error, details } body via PdfOpsError.
 
 export interface PdfOpsOptions {
@@ -28,13 +28,15 @@ export interface PdfOpsOptions {
 }
 
 /** This package's version — keep in step with sdk/package.json (asserted in tests). */
-export const SDK_VERSION = '0.6.0';
+export const SDK_VERSION = '0.7.0';
 
 /** Binary PDF input: any of the common runtime shapes. */
 export type PdfInput = Blob | ArrayBuffer | Uint8Array;
 
 export interface InspectedField {
   name: string;
+  /** Alternate/tooltip name (/TU), only when the form has one. */
+  label?: string;
   type: 'text' | 'checkbox' | 'dropdown' | 'radio' | 'optionlist' | 'unsupported';
   value?: string;
   checked?: boolean;
@@ -59,13 +61,25 @@ export interface InspectResult {
 export interface InvoiceParty {
   name: string;
   lines?: string[];
+  /** ISO 3166-1 alpha-2 code in capitals, e.g. "DE". Required with `e_invoice`; the fields below are used with it. */
+  country?: string;
+  street?: string;
+  postcode?: string;
+  city?: string;
+  /** Starts with a two-letter capital country prefix, e.g. "DE123456789" ("EL" for Greece). */
+  vat_id?: string;
+  /** Seller only: EN 16931 has no buyer tax number (to.tax_id is refused, use to.vat_id). */
+  tax_id?: string;
+  registration_id?: string;
 }
 
 export interface InvoiceItem {
   description: string;
-  /** Default 1. */
+  /** Default 1. With `e_invoice`: positive, at most 4 decimals. */
   quantity?: number;
   unit_price: number;
+  /** UN/ECE Recommendation 20 unit code, e.g. "C62" (one), "HUR" (hour), "KGM" (kilogram). Required with `e_invoice`. */
+  unit?: string;
 }
 
 export interface InvoiceRequest {
@@ -81,6 +95,22 @@ export interface InvoiceRequest {
   /** Percent, 0-100. */
   tax_rate?: number;
   notes?: string;
+  /**
+   * "factur-x" returns a Factur-X / ZUGFeRD (EN 16931) PDF with the XML embedded.
+   * It also requires an object `from` and `to` with `name` and `country`, `invoice_number`,
+   * `date`, `currency` (no default), a `due` date or `payment_terms`, a unit on every item,
+   * and the seller's `vat_id` (or `tax_id` plus `registration_id`). A request that lacks
+   * some of these fails with `einvoice_fields_required`; the names are in `PdfOpsError.body.missing`.
+   */
+  e_invoice?: 'factur-x';
+  /** EN 16931 VAT category: S standard (default when tax_rate > 0), Z zero rate, E exempt, AE reverse charge, O not subject to VAT. Required with `e_invoice` when tax_rate is 0. */
+  tax_category?: 'S' | 'Z' | 'E' | 'AE' | 'O';
+  /** Required with `e_invoice` for tax_category E, AE and O. */
+  tax_exemption_reason?: string;
+  /** With `e_invoice`, either this or `due` is required. */
+  payment_terms?: string;
+  /** IBAN to pay into (checksum verified). Used only with `e_invoice`. */
+  iban?: string;
 }
 
 export interface UsageResult {
@@ -144,19 +174,278 @@ export type PageNumberPosition =
 
 export type ProtectPermission = 'print' | 'copy' | 'modify' | 'annotate' | 'fill-forms';
 
+interface FieldBox {
+  /** Points from the bottom-left of the page as displayed (after /Rotate). */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface FieldCommon {
+  /** Unique field name, 1-200 chars, no ".". */
+  name: string;
+  /** 1-based page number. */
+  page: number;
+  required?: boolean;
+  read_only?: boolean;
+  /** Default true. */
+  border?: boolean;
+  /** Paint an opaque white background. Default false. */
+  background?: boolean;
+}
+
+/** A form field for addFields(). For `radio`, the box of each option is used, not the group's. */
+export type AddFieldSpec =
+  | (FieldCommon &
+      FieldBox & {
+        type: 'text';
+        multiline?: boolean;
+        max_length?: number;
+        default?: string;
+        font_size?: number | 'auto';
+      })
+  | (FieldCommon & FieldBox & { type: 'checkbox'; checked?: boolean })
+  | (FieldCommon & {
+      type: 'radio';
+      options: (FieldBox & { value: string })[];
+      default?: string;
+    })
+  | (FieldCommon &
+      FieldBox & { type: 'dropdown'; options: string[]; default?: string; font_size?: number | 'auto' })
+  | (FieldCommon & FieldBox & { type: 'signature' });
+
+export interface AddFieldsResult {
+  pdf: Uint8Array;
+  /** The API's x-pdfops-warning header: starts with "xfa-layer-dropped" when the input was hybrid AcroForm/XFA. */
+  warning?: string;
+}
+
+export interface AttachFile {
+  /** The file's bytes. */
+  data: PdfInput;
+  /** Name inside the PDF: 1-255 chars, no "/" or backslash. */
+  name: string;
+  /** Default: the Blob's type, else "application/octet-stream". */
+  mimeType?: string;
+  description?: string;
+  /** PDF/A-3 AFRelationship. Default "Unspecified". */
+  relationship?: 'Alternative' | 'Data' | 'Source' | 'Supplement' | 'Unspecified';
+}
+
+export interface AttachResult {
+  pdf: Uint8Array;
+  /** The API's x-pdfops-attachment-keys header, parsed: the lookup key of each added file, in request order (names cut to 40 characters). */
+  attachmentKeys: { name: string; key: string }[];
+}
+
+export type EditFont =
+  | 'Helvetica'
+  | 'Helvetica-Bold'
+  | 'Helvetica-Oblique'
+  | 'Times-Roman'
+  | 'Times-Bold'
+  | 'Courier';
+
+/** Position of a stamp: points from the bottom-left of the page as displayed. */
+interface EditAt {
+  /** 1-based page number. */
+  page: number;
+  x: number;
+  y: number;
+}
+
+export type EditItem =
+  | (EditAt & {
+      type: 'text';
+      /** 1-2000 chars, WinAnsi only. */
+      text: string;
+      /** 4-200 pt, default 12. */
+      size?: number;
+      /** Hex #rgb or #rrggbb, default #000000. */
+      color?: string;
+      font?: EditFont;
+      /** 0.05-1, default 1. */
+      opacity?: number;
+      /** Degrees counter-clockwise, default 0. */
+      rotation?: number;
+      /** Wrap words to this width (points). */
+      maxWidth?: number;
+      /** Multiple of size, 0.5-5, default 1.2. */
+      lineHeight?: number;
+    })
+  | (EditAt & {
+      type: 'image';
+      /** A key of the `images` option of edit(). PNG or JPEG, up to 2 MB each, at most 10 distinct. */
+      image: string;
+      /** Points; only one given keeps the aspect ratio. */
+      width?: number;
+      height?: number;
+      opacity?: number;
+    })
+  | (EditAt & {
+      type: 'barcode';
+      format:
+        | 'qrcode'
+        | 'datamatrix'
+        | 'pdf417'
+        | 'azteccode'
+        | 'code128'
+        | 'code39'
+        | 'ean13'
+        | 'ean8'
+        | 'upca'
+        | 'itf14'
+        | 'interleaved2of5'
+        | 'gs1-128';
+      /** 1-3000 chars; the format's own rules apply. */
+      value: string;
+      width?: number;
+      height?: number;
+      color?: string;
+      background?: string;
+      /** Print the human-readable value (linear codes). */
+      includeText?: boolean;
+      /** qrcode only, default "M". */
+      errorCorrection?: 'L' | 'M' | 'Q' | 'H';
+      opacity?: number;
+    });
+
+export interface ExtractedLine {
+  text: string;
+  x: number;
+  /** Baseline. */
+  y: number;
+  width: number;
+  fontSize: number;
+}
+
+export interface ExtractedTable {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rows: string[][];
+  /** Only with tablesFormat "csv": the table as RFC 4180 CSV, CRLF line ends. */
+  csv?: string;
+}
+
+export interface ExtractTextResult {
+  pageCount: number;
+  pages: {
+    page: number;
+    width: number;
+    height: number;
+    text: string;
+    lines: ExtractedLine[];
+    tables: ExtractedTable[];
+  }[];
+  /** Selected pages with no text layer (scans). OCR is not supported. */
+  pagesWithoutText: number[];
+  /** The read stopped at the page or output cap; continue with `pages: "<last returned page + 1>-"`. */
+  truncated: boolean;
+}
+
+export interface ExtractTextPlainResult {
+  /** Pages separated by a form feed. */
+  text: string;
+  /** The API's X-PDFops-Truncated header. */
+  truncated: boolean;
+}
+
+export interface ExtractXlsxResult {
+  /** One .xlsx workbook, one sheet per table. */
+  xlsx: Uint8Array;
+  /** The API's X-PDFops-Truncated header. */
+  truncated: boolean;
+  /** The API's X-PDFops-Truncated-By header split into caps: pages, output, sheets, columns, rows. */
+  truncatedBy: string[];
+  /** The API's X-PDFops-Cells-Truncated header: a cell over 32,767 characters was cut. */
+  cellsTruncated: boolean;
+}
+
+export interface FindTextHit {
+  page: number;
+  /** The matched text. */
+  text: string;
+  /** The line it is on (cut around the match when line_truncated). */
+  line: string;
+  line_truncated?: true;
+  /** The edit() frame: points from the bottom-left, y on the baseline, height the font size. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface FindTextResult {
+  /** Hits returned. */
+  count: number;
+  truncated: boolean;
+  hits: FindTextHit[];
+  pagesWithoutText: number[];
+  pagesScanned: number;
+  /** First page not fully searched; null when the scan finished. Repeat with `pages: "<nextPage>-"` to continue. */
+  nextPage: number | null;
+  pagesSkipped?: { page: number; reason: string }[];
+  linesSkipped?: number;
+}
+
+export interface HtmlToPdfRequest {
+  /** Up to the API's size cap in UTF-8. */
+  html: string;
+  /** Default "letter". */
+  page_size?: 'a4' | 'letter';
+  landscape?: boolean;
+  /** Points, 0-144, one value or per side. Default 36. */
+  margin?: number | { top?: number; right?: number; bottom?: number; left?: number };
+  /** Default true. */
+  print_background?: boolean;
+  /** 0.1-2, default 1. */
+  scale?: number;
+}
+
+export interface HtmlToPdfResult {
+  pdf: Uint8Array;
+  /** The API's x-pdfops-pages header. */
+  pages?: number;
+  /** The API's x-pdfops-blocked-requests header: external requests the renderer refused. */
+  blockedRequests?: number;
+}
+
+export interface TextToPdfRequest {
+  content: string;
+  /** Default "markdown". */
+  format?: 'markdown' | 'text' | 'csv';
+  /** Default "letter". */
+  page_size?: 'a4' | 'letter';
+  /** Points, 18-144, default 54. */
+  margin?: number;
+  /** Points, 6-36, default 11. */
+  font_size?: number;
+  /** PDF metadata title, up to 200 chars. */
+  title?: string;
+  /** "Page n of N" footer. Default false. */
+  page_numbers?: boolean;
+  /** Text format only. Default false. */
+  monospace?: boolean;
+}
+
 /** Structured API error — `code` is the API's stable `error` slug. */
 export class PdfOpsError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
     details: string,
+    /** The parsed JSON error body when there was one, for fields beyond `error`/`details` (e.g. `missing`, `nextPage`). */
+    public readonly body?: Record<string, unknown>,
   ) {
     super(`${code}: ${details}`);
     this.name = 'PdfOpsError';
   }
 }
 
-const toBlob = (input: PdfInput): Blob => {
+const toBlob = (input: PdfInput, type = 'application/pdf'): Blob => {
   if (input instanceof Blob) return input;
   // Copy into a fresh ArrayBuffer-backed view — accepts SharedArrayBuffer
   // views and offset subarrays alike.
@@ -164,7 +453,7 @@ const toBlob = (input: PdfInput): Blob => {
     input instanceof Uint8Array ? input : new Uint8Array(input);
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
-  return new Blob([copy], { type: 'application/pdf' });
+  return new Blob([copy], { type });
 };
 
 const fromBase64 = (b64: string): Uint8Array => {
@@ -185,7 +474,9 @@ export class PdfOps {
   constructor(options: PdfOpsOptions = {}) {
     this.apiKey = options.apiKey;
     this.baseUrl = (options.baseUrl ?? 'https://pdfops.dev').replace(/\/$/, '');
-    this.fetchImpl = options.fetch ?? fetch;
+    // Wrapped, not stored bare: Workers and browsers throw "Illegal invocation" when the
+    // global fetch is called as a method of another object.
+    this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
     this.clientTag = options.clientTag ?? 'sdk';
     this.clientVersion =
       options.clientVersion ?? (options.clientTag ? undefined : SDK_VERSION);
@@ -202,18 +493,25 @@ export class PdfOps {
   }
 
   private async request(path: string, init: RequestInit): Promise<Response> {
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, init);
+    // redirect: 'manual' so a 3xx can never forward the API key and body to another origin;
+    // it surfaces below as PdfOpsError http_3xx. Not 'error': Cloudflare Workers rejects that value.
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, redirect: 'manual' });
     if (!res.ok) {
       let code = `http_${res.status}`;
       let details = res.statusText;
+      let errBody: Record<string, unknown> | undefined;
       try {
-        const body = (await res.json()) as { error?: string; details?: string };
-        if (body.error) code = body.error;
-        if (body.details) details = body.details;
+        const body = (await res.json()) as unknown;
+        if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+          const o = body as Record<string, unknown>;
+          if (typeof o.error === 'string' && o.error) code = o.error;
+          if (typeof o.details === 'string' && o.details) details = o.details;
+          errBody = o;
+        }
       } catch {
         // non-JSON error body — keep the status fallback
       }
-      throw new PdfOpsError(res.status, code, details);
+      throw new PdfOpsError(res.status, code, details, errBody);
     }
     return res;
   }
@@ -520,6 +818,275 @@ export class PdfOps {
       keywords: opts.keywords?.join(','),
       password: opts.password,
     });
+  }
+
+  /**
+   * Create AcroForm fields (text, checkbox, radio, dropdown, signature) at
+   * positions on a PDF, up to 200 per call. x/y are points from the
+   * bottom-left of the page as displayed, the same frame as edit().
+   * Returns the bytes plus `warning` when the input was hybrid AcroForm/XFA.
+   * Errors: invalid_fields, too_many_fields, duplicate_field, invalid_pages,
+   * unsupported_characters.
+   */
+  async addFields(
+    pdf: PdfInput,
+    fields: AddFieldSpec[],
+    opts?: { password?: string },
+  ): Promise<AddFieldsResult> {
+    const res = await this.formRequest('/api/add-fields', pdf, {
+      fields: JSON.stringify(fields),
+      password: opts?.password,
+    });
+    const warning = res.headers.get('x-pdfops-warning') ?? undefined;
+    return { pdf: new Uint8Array(await res.arrayBuffer()), ...(warning ? { warning } : {}) };
+  }
+
+  /**
+   * Embed files in a PDF (for example the XML of an e-invoice), in the
+   * order given. Returns the bytes plus `attachmentKeys`, the lookup key of
+   * each added file.
+   * Errors: missing_files, too_many_files, files_too_large, invalid_name,
+   * invalid_mime_type, invalid_relationship, duplicate_name,
+   * too_many_attachments.
+   */
+  async attach(
+    pdf: PdfInput,
+    files: AttachFile[],
+    opts?: { password?: string },
+  ): Promise<AttachResult> {
+    const fd = new FormData();
+    fd.append('pdf', toBlob(pdf), 'input.pdf');
+    for (const f of files) {
+      fd.append('file', toBlob(f.data, f.mimeType ?? 'application/octet-stream'), f.name);
+    }
+    fd.append(
+      'options',
+      JSON.stringify(
+        files.map((f) => ({
+          name: f.name,
+          mime_type: f.mimeType,
+          description: f.description,
+          relationship: f.relationship,
+        })),
+      ),
+    );
+    if (opts?.password !== undefined) fd.append('password', opts.password);
+    const res = await this.request('/api/attach', {
+      method: 'POST',
+      headers: this.headers(),
+      body: fd,
+    });
+    // Response headers are untrusted: a bad value gives [], never a throw after a charged call.
+    let attachmentKeys: { name: string; key: string }[] = [];
+    try {
+      const parsed: unknown = JSON.parse(res.headers.get('x-pdfops-attachment-keys') ?? '[]');
+      // All or nothing: dropping one bad entry would shift the rest against the files sent.
+      if (
+        Array.isArray(parsed) &&
+        parsed.length === files.length &&
+        parsed.every((e) => e !== null && typeof e === 'object' && typeof e.name === 'string' && typeof e.key === 'string')
+      ) {
+        attachmentKeys = parsed.map((e) => ({ name: e.name, key: e.key }));
+      }
+    } catch {
+      attachmentKeys = [];
+    }
+    return { pdf: new Uint8Array(await res.arrayBuffer()), attachmentKeys };
+  }
+
+  /**
+   * Stamp text, images and barcodes (QR, Code 128, EAN, ...) onto pages, up
+   * to 100 items. x/y are points from the bottom-left of the page as
+   * displayed. An `image` item names a key of `opts.images`, whose value is
+   * the PNG or JPEG bytes. A key is 1-64 characters of A-Z a-z 0-9 _ . -
+   * and not "pdf", "items" or "password"; anything else throws before sending.
+   * Errors: invalid_items, too_many_items, unsupported_characters,
+   * invalid_pages, invalid_image.
+   */
+  async edit(
+    pdf: PdfInput,
+    items: EditItem[],
+    opts?: { images?: Record<string, PdfInput>; password?: string },
+  ): Promise<Uint8Array> {
+    const images = Object.entries(opts?.images ?? {});
+    for (const [name] of images) {
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name) || ['pdf', 'password', 'items'].includes(name)) {
+        throw new Error(`edit: invalid image key "${name.slice(0, 40)}": use 1-64 of A-Z a-z 0-9 _ . - and not pdf, password or items`);
+      }
+    }
+    const fd = new FormData();
+    fd.append('pdf', toBlob(pdf), 'input.pdf');
+    fd.append('items', JSON.stringify(items));
+    for (const [name, data] of images) {
+      fd.append(name, toBlob(data, 'application/octet-stream'), name);
+    }
+    if (opts?.password !== undefined) fd.append('password', opts.password);
+    const res = await this.request('/api/edit', {
+      method: 'POST',
+      headers: this.headers(),
+      body: fd,
+    });
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * Read the text layer of a born-digital PDF (no OCR): per-page text in
+   * reading order, every line with its position, and tables found from the
+   * layout. `tablesFormat: 'csv'` adds a `csv` string to each table.
+   * `truncated` is true when the read stopped at a cap; continue with
+   * `pages: "<last returned page + 1>-"`.
+   * Errors: invalid_pages, encrypted_pdf, too_many_pages.
+   */
+  async extractText(
+    pdf: PdfInput,
+    opts?: { pages?: string; tablesFormat?: 'json' | 'csv'; password?: string },
+  ): Promise<ExtractTextResult> {
+    if ((opts?.tablesFormat as string | undefined) === 'xlsx') {
+      throw new Error('extractText cannot return a workbook; use extractTablesXlsx() for tablesFormat "xlsx"');
+    }
+    const res = await this.formRequest('/api/extract-text', pdf, {
+      pages: opts?.pages,
+      tables_format: opts?.tablesFormat,
+      password: opts?.password,
+    });
+    return (await res.json()) as ExtractTextResult;
+  }
+
+  /**
+   * extractText() as plain text: pages separated by a form feed. `truncated`
+   * is the API's X-PDFops-Truncated header.
+   */
+  async extractTextPlain(
+    pdf: PdfInput,
+    opts?: { pages?: string; password?: string },
+  ): Promise<ExtractTextPlainResult> {
+    const res = await this.formRequest('/api/extract-text', pdf, {
+      format: 'text',
+      pages: opts?.pages,
+      password: opts?.password,
+    });
+    return { text: await res.text(), truncated: res.headers.get('x-pdfops-truncated') === 'true' };
+  }
+
+  /**
+   * The tables of a born-digital PDF as one .xlsx workbook (one sheet per
+   * table, every cell text). Also returns which caps cut the read short.
+   * Errors: no_tables when none were found; if the read stopped early,
+   * `PdfOpsError.body` carries `truncated` and `nextPage`.
+   */
+  async extractTablesXlsx(
+    pdf: PdfInput,
+    opts?: { pages?: string; password?: string },
+  ): Promise<ExtractXlsxResult> {
+    const res = await this.formRequest('/api/extract-text', pdf, {
+      tables_format: 'xlsx',
+      pages: opts?.pages,
+      password: opts?.password,
+    });
+    return {
+      xlsx: new Uint8Array(await res.arrayBuffer()),
+      truncated: res.headers.get('x-pdfops-truncated') === 'true',
+      truncatedBy: (res.headers.get('x-pdfops-truncated-by') ?? '').split(',').filter(Boolean),
+      cellsTruncated: res.headers.get('x-pdfops-cells-truncated') === 'true',
+    };
+  }
+
+  /**
+   * Find text (or a regular expression from a linear-time subset) in a
+   * born-digital PDF; each hit has its page and a box in the edit() frame.
+   * Matching is within one line. When `nextPage` is not null the scan
+   * stopped early: repeat with `pages: "<nextPage>-"`.
+   * Errors: missing_query, query_too_long, invalid_regex, invalid_parameter.
+   */
+  async findText(
+    pdf: PdfInput,
+    query: string,
+    opts?: {
+      regex?: boolean;
+      caseSensitive?: boolean;
+      wholeWord?: boolean;
+      pages?: string;
+      /** 1-1000, default 100. */
+      maxHits?: number;
+      password?: string;
+    },
+  ): Promise<FindTextResult> {
+    const res = await this.formRequest('/api/find-text', pdf, {
+      query,
+      regex: opts?.regex?.toString(),
+      case_sensitive: opts?.caseSensitive?.toString(),
+      whole_word: opts?.wholeWord?.toString(),
+      pages: opts?.pages,
+      max_hits: opts?.maxHits,
+      password: opts?.password,
+    });
+    return (await res.json()) as FindTextResult;
+  }
+
+  /**
+   * Render an HTML document to PDF in headless Chromium. Returns the bytes
+   * plus `pages` and `blockedRequests` from the response headers.
+   * Errors: missing_html, html_too_large, invalid_page_size,
+   * invalid_parameter, too_many_pages, render_timeout, renderer_busy and
+   * renderer_unavailable (503, retry shortly).
+   */
+  async htmlToPdf(request: HtmlToPdfRequest): Promise<HtmlToPdfResult> {
+    const res = await this.request('/api/html-to-pdf', {
+      method: 'POST',
+      headers: { ...this.headers(), 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    const pages = res.headers.get('x-pdfops-pages');
+    const blocked = res.headers.get('x-pdfops-blocked-requests');
+    return {
+      pdf: new Uint8Array(await res.arrayBuffer()),
+      ...(pages && /^\d+$/.test(pages) ? { pages: Number(pages) } : {}),
+      ...(blocked && /^\d+$/.test(blocked) ? { blockedRequests: Number(blocked) } : {}),
+    };
+  }
+
+  /**
+   * One PDF page per JPG or PNG, in the order given. `pageSize` "fit"
+   * (default) makes each page the image's size; "a4" and "letter" scale the
+   * image to fit inside `margin` points (default 36; 0 for "fit").
+   * Errors: unsupported_image_format, invalid_image, image_too_large,
+   * too_many_images, invalid_parameter.
+   */
+  async imageToPdf(
+    images: PdfInput[],
+    opts?: {
+      pageSize?: 'fit' | 'a4' | 'letter';
+      orientation?: 'auto' | 'portrait' | 'landscape';
+      margin?: number;
+    },
+  ): Promise<Uint8Array> {
+    const fd = new FormData();
+    images.forEach((img, i) => fd.append('pdf', toBlob(img, 'application/octet-stream'), `image-${i}`));
+    if (opts?.pageSize !== undefined) fd.append('page_size', opts.pageSize);
+    if (opts?.orientation !== undefined) fd.append('orientation', opts.orientation);
+    if (opts?.margin !== undefined) fd.append('margin', String(opts.margin));
+    const res = await this.request('/api/image-to-pdf', {
+      method: 'POST',
+      headers: this.headers(),
+      body: fd,
+    });
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * Lay out Markdown, plain text or CSV as a PDF (built-in fonts, no
+   * Chromium). Deterministic: the same request returns identical bytes.
+   * Output is never branded. Standard Helvetica characters only.
+   * Errors: missing_content, content_too_large, invalid_format,
+   * unsupported_characters, invalid_csv, too_many_pages, invalid_parameter.
+   */
+  async textToPdf(request: TextToPdfRequest): Promise<Uint8Array> {
+    const res = await this.request('/api/text-to-pdf', {
+      method: 'POST',
+      headers: { ...this.headers(), 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   /** Current quota state for the configured API key. */
