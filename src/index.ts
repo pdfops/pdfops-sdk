@@ -28,7 +28,7 @@ export interface PdfOpsOptions {
 }
 
 /** This package's version — keep in step with sdk/package.json (asserted in tests). */
-export const SDK_VERSION = '0.7.0';
+export const SDK_VERSION = '0.8.0';
 
 /** Binary PDF input: any of the common runtime shapes. */
 export type PdfInput = Blob | ArrayBuffer | Uint8Array;
@@ -219,6 +219,68 @@ export interface AddFieldsResult {
   pdf: Uint8Array;
   /** The API's x-pdfops-warning header: starts with "xfa-layer-dropped" when the input was hybrid AcroForm/XFA. */
   warning?: string;
+}
+
+/** A field suggested by detectFields(). It can be passed to addFields() as it is (`label` and `confidence` are ignored there). */
+export interface DetectedField {
+  type: 'text' | 'checkbox';
+  /** Taken from the nearest printed label; unique, and not already a field name in the PDF. */
+  name: string;
+  /** 1-based. */
+  page: number;
+  /** Points from the bottom-left of the page as displayed, the edit() frame. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** The nearest printed text the name came from. */
+  label: string;
+  /** 0 to 1. */
+  confidence: number;
+}
+
+export interface DetectFieldsResult {
+  pages: { page: number; width: number; height: number; fields: number }[];
+  count: number;
+  /** The answer is incomplete: add the fields, then call again on the resulting PDF with `pages: nextPages`; repeat until false. */
+  truncated: boolean;
+  nextPage?: number;
+  /** The exact pages not done, as a page spec such as "5-9". */
+  nextPages?: string;
+  /** Pages not analysed. `too_complex`: more drawn shapes or text than the per-page limits (final); `deadline`: the call stopped first (the page is in `nextPages`). */
+  pagesSkipped?: { page: number; reason: 'too_complex' | 'deadline' }[];
+  note?: string;
+  fields: DetectedField[];
+}
+
+export interface DetectFieldsPdfResult {
+  /** The fillable PDF: the input plus the detected fields. */
+  pdf: Uint8Array;
+  /** X-PDFops-Fields: how many fields were added in this call (summed over rounds by makeFillable). */
+  count: number;
+  /** X-PDFops-Field-Names. A final "..." means the header was cut and more names were added than are listed. */
+  names: string[];
+  /** X-PDFops-Truncated: send `pdf` again with `pages: nextPages` (or use makeFillable). */
+  truncated: boolean;
+  /** X-PDFops-Truncated-By: pages, fields and/or deadline. */
+  truncatedBy: string[];
+  /** X-PDFops-Next-Pages: the pages not done, as a page spec. */
+  nextPages?: string;
+  /** X-PDFops-Pages-Skipped: pages not analysed because they hold more shapes or text than the per-page limits. */
+  pagesSkipped: number[];
+  /** x-pdfops-warning: the input had an XFA layer that the save dropped. */
+  warning?: string;  /** Set by makeFillable() when a later round failed (quota, size, network): the PDF and count then hold what the earlier rounds added and `nextPages` the pages to resume with. */
+  stoppedBy?: { code: string; message: string };
+}
+
+export interface DetectFieldsOptions {
+  /** 1-based page spec such as "1-3,5,8-". Default all. */
+  pages?: string;
+  /** Analyse at most this many pages. Default 40, at most 100. */
+  maxPages?: number;
+  /** 0 to 1; weaker candidates are dropped. Default 0.4. */
+  minConfidence?: number;
+  password?: string;
 }
 
 export interface AttachFile {
@@ -839,6 +901,213 @@ export class PdfOps {
     });
     const warning = res.headers.get('x-pdfops-warning') ?? undefined;
     return { pdf: new Uint8Array(await res.arrayBuffer()), ...(warning ? { warning } : {}) };
+  }
+
+  /**
+   * Suggest fillable fields for a flat PDF. Detects fields drawn as lines,
+   * boxes, underscores and checkboxes; review the result. Nothing is added:
+   * the PDF is not changed. Each entry of `fields` can be passed to
+   * addFields() as it is. When `truncated` is true: add the fields, then call
+   * again on the resulting PDF with `pages: nextPages`; repeat until false.
+   * For the fillable PDF in one call see detectFieldsPdf(), and makeFillable()
+   * for the loop.
+   * Errors: invalid_pdf, encrypted_pdf, decompressed_too_large,
+   * too_many_pages, invalid_pages, invalid_parameter.
+   */
+  async detectFields(pdf: PdfInput, opts?: DetectFieldsOptions): Promise<DetectFieldsResult> {
+    const res = await this.formRequest('/api/detect-fields', pdf, {
+      pages: opts?.pages,
+      max_pages: opts?.maxPages,
+      min_confidence: opts?.minConfidence,
+      password: opts?.password,
+    });
+    return (await res.json()) as DetectFieldsResult;
+  }
+
+  /**
+   * detectFields() with `format=pdf`: detects the fields and adds them in one
+   * request, returning the fillable PDF and the X-PDFops-* headers. When
+   * `truncated` is true, send `pdf` again with `pages: nextPages` (the
+   * original PDF again repeats the same names).
+   * Errors: no_fields (nothing detected, no PDF is made; `PdfOpsError.body`
+   * also has `truncated` and `nextPages` when pages were left), plus those
+   * of detectFields() and too_many_fields, duplicate_field.
+   */
+  async detectFieldsPdf(pdf: PdfInput, opts?: DetectFieldsOptions): Promise<DetectFieldsPdfResult> {
+    const res = await this.formRequest('/api/detect-fields', pdf, {
+      format: 'pdf',
+      pages: opts?.pages,
+      max_pages: opts?.maxPages,
+      min_confidence: opts?.minConfidence,
+      password: opts?.password,
+    });
+    let names: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(res.headers.get('x-pdfops-field-names') ?? '[]');
+      if (Array.isArray(parsed)) names = parsed.filter((n): n is string => typeof n === 'string');
+    } catch {
+      // a header that is not JSON leaves the names empty
+    }
+    const count = Number(res.headers.get('x-pdfops-fields'));
+    const nextPages = res.headers.get('x-pdfops-next-pages') ?? undefined;
+    const warning = res.headers.get('x-pdfops-warning') ?? undefined;
+    return {
+      pdf: new Uint8Array(await res.arrayBuffer()),
+      count: Number.isSafeInteger(count) && count > 0 ? count : 0,
+      names,
+      truncated: res.headers.get('x-pdfops-truncated') === 'true',
+      truncatedBy: (res.headers.get('x-pdfops-truncated-by') ?? '').split(',').filter(Boolean),
+      ...(nextPages ? { nextPages } : {}),
+      pagesSkipped: (res.headers.get('x-pdfops-pages-skipped') ?? '')
+        .split(',')
+        .filter((p) => /^\d+$/.test(p))
+        .map(Number),
+      ...(warning ? { warning } : {}),
+    };
+  }
+
+  /**
+   * Make a flat PDF fillable: runs detectFieldsPdf() and, while the answer is
+   * truncated, sends the resulting PDF again with `pages: nextPages`, until it
+   * is complete or `maxRounds` calls were made (default 25; each call is
+   * metered). Returns the final PDF with `count` and `names` summed over the
+   * rounds (`names` can include a "..." marker), `pagesSkipped` merged, and
+   * `truncated` still true if the round limit stopped it. no_fields with pages
+   * left (`truncated` and `nextPages` in the error body) is not the end: the loop goes on
+   * with those pages. A round that finds nothing new for the pages it sent ends the
+   * loop, and a document with no detectable fields anywhere throws no_fields. If a later
+   * round fails (quota, size, network) the PDF and counts so far are returned with
+   * `truncated` true, `nextPages` to resume with and the error in `stoppedBy`; a
+   * first-round failure throws. Any stop that leaves pages undone sets `stoppedBy.code`
+   * (`stalled`, `max_rounds`, or the error's code), and the partial PDF is returned only if
+   * at least one field was added; otherwise the call throws. `warning` is the first XFA warning seen. Review the
+   * result: fields are suggestions.
+   */
+  async makeFillable(
+    pdf: PdfInput,
+    opts?: DetectFieldsOptions & { maxRounds?: number },
+  ): Promise<DetectFieldsPdfResult> {
+    // Continuation rules (the same in the Python and JS SDKs and the n8n node):
+    //  - A round that adds fields or answers no_fields with nextPages goes on with those pages.
+    //  - The same pages offered again with nothing added is a stall (stop code 'stalled'); the
+    //    round limit is 'max_rounds'; a later-round API or network failure keeps its own code.
+    //  - A partial result is returned only if at least one field was added. With none, the call
+    //    throws: a later-round error as it is, a stall or the round limit as no_fields saying which
+    //    pages remain, and a final no_fields carries the skipped pages.
+    //  - Only too_complex skips are final and accumulate; a deadline skip is offered again in
+    //    nextPages and is not "not analysed".
+    //  - A finished job (not truncated) has no truncatedBy and no nextPages.
+    const maxRounds = opts?.maxRounds ?? 25;
+    if (!Number.isInteger(maxRounds) || maxRounds < 1) throw new Error('maxRounds must be a positive integer');
+    let current: PdfInput = pdf;
+    let sendPages = opts?.pages;
+    let count = 0;
+    const names: string[] = [];
+    const skipped = new Set<number>();
+    let warning: string | undefined;
+    let truncatedBy: string[] = [];
+    let nextPages: string | undefined;
+    let truncated = false;
+    let stoppedBy: { code: string; message: string } | undefined;
+    let stopError: unknown;
+    let lastNoFields: PdfOpsError | undefined;
+    let finished = false;
+    for (let i = 0; i < maxRounds; i++) {
+      let res: DetectFieldsPdfResult;
+      try {
+        res = await this.detectFieldsPdf(current, { ...opts, pages: sendPages });
+      } catch (e) {
+        if (e instanceof PdfOpsError && e.code === 'no_fields') {
+          lastNoFields = e;
+          const sk = e.body?.pagesSkipped;
+          if (Array.isArray(sk)) {
+            for (const x of sk) {
+              const y = x as { page?: unknown; reason?: unknown };
+              if (typeof y?.page === 'number' && y.reason === 'too_complex') skipped.add(y.page);
+            }
+          }
+          const np = e.body?.nextPages;
+          nextPages = typeof np === 'string' && np ? np : undefined;
+          truncated = e.body?.truncated === true && nextPages !== undefined;
+          if (truncated && nextPages !== sendPages) {
+            sendPages = nextPages;
+            continue;
+          }
+          if (truncated) stoppedBy = { code: 'stalled', message: `pages ${nextPages} were offered again and nothing was found on them` };
+          finished = true;
+          break;
+        }
+        if (i === 0) throw e;
+        stopError = e;
+        stoppedBy =
+          e instanceof PdfOpsError
+            ? { code: e.code, message: e.message.startsWith(`${e.code}: `) ? e.message.slice(e.code.length + 2) : e.message }
+            : { code: 'network_error', message: e instanceof Error ? e.message : String(e) };
+        truncated = true;
+        nextPages = sendPages;
+        finished = true;
+        break;
+      }
+      lastNoFields = undefined;
+      count += res.count;
+      names.push(...res.names);
+      res.pagesSkipped.forEach((p) => skipped.add(p));
+      warning = warning ?? res.warning;
+      truncatedBy = res.truncatedBy;
+      current = res.pdf;
+      truncated = res.truncated;
+      nextPages = res.nextPages;
+      if (!truncated || !nextPages) {
+        finished = true;
+        break;
+      }
+      if (nextPages === sendPages && res.count === 0) {
+        stoppedBy = { code: 'stalled', message: `pages ${nextPages} were offered again and nothing new was found on them` };
+        finished = true;
+        break;
+      }
+      sendPages = nextPages;
+    }
+    if (!finished) {
+      truncated = true; // round limit reached with pages left
+      stoppedBy = { code: 'max_rounds', message: `stopped at the limit of ${maxRounds} calls` };
+    }
+    if (!truncated) {
+      truncatedBy = [];
+      nextPages = undefined;
+    }
+    if (count === 0) {
+      if (stopError) throw stopError;
+      const skippedBody = [...skipped].sort((a, b) => a - b).map((page) => ({ page, reason: 'too_complex' }));
+      if (stoppedBy) {
+        const left = nextPages ? `; pages ${nextPages} remain` : '';
+        throw new PdfOpsError(400, 'no_fields', `No fields found in the pages analysed so far${left} (stopped: ${stoppedBy.code}).`, {
+          error: 'no_fields',
+          truncated: true,
+          nextPages,
+          stoppedBy: stoppedBy.code,
+          ...(skippedBody.length ? { pagesSkipped: skippedBody } : {}),
+        });
+      }
+      if (lastNoFields) {
+        if (!skippedBody.length) throw lastNoFields;
+        throw new PdfOpsError(lastNoFields.status, 'no_fields', lastNoFields.message.replace(/^no_fields: /, ''), {
+          ...lastNoFields.body,
+          pagesSkipped: skippedBody,
+        });
+      }
+    }
+    return {
+      pdf: current instanceof Uint8Array ? current : new Uint8Array(await toBlob(current).arrayBuffer()),
+      count,
+      names,
+      truncated,
+      truncatedBy,
+      ...(nextPages ? { nextPages } : {}),
+      pagesSkipped: [...skipped].sort((a, b) => a - b),
+      ...(warning ? { warning } : {}),
+      ...(stoppedBy ? { stoppedBy } : {}),
+    };
   }
 
   /**

@@ -43,7 +43,7 @@ const field = (s: Seen, name: string) => s.parts.find(([k]) => k === name)?.[1];
 test('SDK_VERSION matches package.json', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(SDK_VERSION, pkg.version);
-  assert.equal(SDK_VERSION, '0.7.0');
+  assert.equal(SDK_VERSION, '0.8.0');
 });
 
 test('addFields sends fields JSON and surfaces x-pdfops-warning', async () => {
@@ -357,4 +357,212 @@ test('extractText with tablesFormat xlsx throws before sending', async () => {
   const { seen, client } = harness(jsonResponse({}));
   await assert.rejects(client.extractText(PDF, { tablesFormat: 'xlsx' as never }), /extractTablesXlsx/);
   assert.equal(seen.length, 0);
+});
+
+test('detectFields posts the options and returns the JSON body', async () => {
+  const api = { pages: [], count: 1, truncated: false, fields: [{ type: 'text', name: 'Name', page: 1 }] };
+  const { seen, client } = harness(jsonResponse(api));
+  const r = await client.detectFields(PDF, { pages: '1-2', maxPages: 5, minConfidence: 0.6, password: 'pw' });
+  assert.deepEqual(r, api);
+  assert.equal(seen[0].path, '/api/detect-fields');
+  assert.deepEqual(
+    seen[0].parts.filter(([k]) => k !== 'pdf'),
+    [['pages', '1-2'], ['max_pages', '5'], ['min_confidence', '0.6'], ['password', 'pw']],
+  );
+});
+
+test('detectFieldsPdf returns the PDF and reads the X-PDFops headers', async () => {
+  const { seen, client } = harness(
+    pdfResponse({
+      'X-PDFops-Fields': '8',
+      'X-PDFops-Field-Names': JSON.stringify(['Name', 'Date', '...']),
+      'X-PDFops-Truncated': 'true',
+      'X-PDFops-Truncated-By': 'pages,fields',
+      'X-PDFops-Next-Pages': '41-80',
+      'X-PDFops-Pages-Skipped': '3,7',
+      'x-pdfops-warning': 'xfa',
+    }),
+  );
+  const r = await client.detectFieldsPdf(PDF, { pages: '1-' });
+  assert.equal(field(seen[0], 'format'), 'pdf');
+  assert.equal(field(seen[0], 'pages'), '1-');
+  assert.equal(r.pdf.length, OUT.length);
+  assert.deepEqual(
+    [r.count, r.names, r.truncated, r.truncatedBy, r.nextPages, r.pagesSkipped, r.warning],
+    [8, ['Name', 'Date', '...'], true, ['pages', 'fields'], '41-80', [3, 7], 'xfa'],
+  );
+  const clean = await harness(pdfResponse({ 'X-PDFops-Fields': '2' })).client.detectFieldsPdf(PDF);
+  assert.deepEqual(
+    [clean.count, clean.names, clean.truncated, clean.truncatedBy, clean.nextPages, clean.pagesSkipped],
+    [2, [], false, [], undefined, []],
+  );
+});
+
+test('detectFieldsPdf no_fields error exposes truncated and nextPages on body', async () => {
+  const { client } = harness(
+    () => new Response(JSON.stringify({ error: 'no_fields', details: 'none', truncated: true, nextPages: '5-' }), { status: 400 }),
+  );
+  await assert.rejects(client.detectFieldsPdf(PDF), (e: unknown) => {
+    assert.ok(e instanceof PdfOpsError);
+    assert.equal(e.code, 'no_fields');
+    assert.equal(e.body?.nextPages, '5-');
+    return true;
+  });
+});
+
+const sequence = (rounds: (() => Response)[]) => {
+  const seen: Seen[] = [];
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    seen.push({
+      path: new URL(url).pathname,
+      method: init.method,
+      headers: init.headers as Record<string, string>,
+      parts: init.body instanceof FormData ? [...init.body.entries()] : [],
+    });
+    return rounds[seen.length - 1]();
+  }) as unknown as typeof fetch;
+  return { seen, client: new PdfOps({ fetch: fetchImpl, baseUrl: 'https://example.test' }) };
+};
+const round = (headers: Record<string, string>) => () =>
+  new Response(OUT, { headers: { 'content-type': 'application/pdf', ...headers } });
+
+test('makeFillable loops with pages=nextPages until not truncated and sums the rounds', async () => {
+  const { seen, client } = sequence([
+    round({ 'X-PDFops-Fields': '200', 'X-PDFops-Field-Names': '["A"]', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '3-9' }),
+    round({ 'X-PDFops-Fields': '5', 'X-PDFops-Field-Names': '["B"]', 'X-PDFops-Pages-Skipped': '4' }),
+  ]);
+  const r = await client.makeFillable(PDF, { pages: '1-', password: 'pw' });
+  assert.equal(seen.length, 2);
+  assert.equal(field(seen[0], 'pages'), '1-');
+  assert.equal(field(seen[1], 'pages'), '3-9');
+  assert.equal(field(seen[1], 'password'), 'pw');
+  assert.equal(field(seen[1], 'format'), 'pdf');
+  assert.deepEqual([r.count, r.names, r.truncated, r.pagesSkipped], [205, ['A', 'B'], false, [4]]);
+});
+
+test('makeFillable stops at maxRounds and rejects a bad maxRounds', async () => {
+  const r1 = round({ 'X-PDFops-Fields': '1', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' });
+  const { seen, client } = sequence([r1, r1, r1]);
+  const r = await client.makeFillable(PDF, { maxRounds: 3 });
+  assert.deepEqual([seen.length, r.count, r.truncated, r.nextPages], [3, 3, true, '2-']);
+  await assert.rejects(client.makeFillable(PDF, { maxRounds: 0 }), /maxRounds/);
+});
+
+test('makeFillable: a later non-truncated no_fields ends the loop, a first one throws', async () => {
+  const nf = () => new Response(JSON.stringify({ error: 'no_fields', details: 'x', truncated: false }), { status: 400 });
+  const { client } = sequence([round({ 'X-PDFops-Fields': '3', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' }), nf]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.count, r.truncated, r.nextPages], [3, false, undefined]);
+  await assert.rejects(sequence([nf]).client.makeFillable(PDF), (e: unknown) => e instanceof PdfOpsError && e.code === 'no_fields');
+});
+
+const nfBody = (b: Record<string, unknown>) => () =>
+  new Response(JSON.stringify({ error: 'no_fields', details: 'none', truncated: false, ...b }), { status: 400 });
+const pagesOf = (seen: Seen[]) => seen.map((s) => field(s, 'pages'));
+
+test('makeFillable continues past no_fields when pages are left (prose first, form on 41-60)', async () => {
+  const { seen, client } = sequence([nfBody({ truncated: true, nextPages: '41-60' }), round({ 'X-PDFops-Fields': '8' })]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.count, r.truncated, seen.length], [8, false, 2]);
+  assert.deepEqual(pagesOf(seen), [undefined, '41-60']);
+});
+
+test('makeFillable: a mid-loop no_fields with pages left continues on the PDF so far', async () => {
+  const { seen, client } = sequence([
+    round({ 'X-PDFops-Fields': '3', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '41-120' }),
+    nfBody({ truncated: true, nextPages: '81-120' }),
+    round({ 'X-PDFops-Fields': '2' }),
+  ]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.count, r.truncated, seen.length], [5, false, 3]);
+  assert.deepEqual(pagesOf(seen), [undefined, '41-120', '81-120']);
+});
+
+const noFieldsErr = (e: unknown, stoppedBy: string, nextPages: string) =>
+  e instanceof PdfOpsError && e.code === 'no_fields' && e.body?.stoppedBy === stoppedBy && e.body?.nextPages === nextPages && e.message.includes(`pages ${nextPages} remain`);
+
+test('makeFillable: a no_fields stall with nothing found throws with the stop reason and the pages left', async () => {
+  const nf = nfBody({ truncated: true, nextPages: '5-' });
+  const { seen, client } = sequence([nf, nf, nf]);
+  await assert.rejects(client.makeFillable(PDF), (e: unknown) => noFieldsErr(e, 'stalled', '5-'));
+  assert.equal(seen.length, 2);
+});
+
+test('makeFillable: a stall after fields keeps the partial with stoppedBy stalled', async () => {
+  const r1 = round({ 'X-PDFops-Fields': '3', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' });
+  const r2 = round({ 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' });
+  const { seen, client } = sequence([r1, r2, r2]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([seen.length, r.count, r.truncated, r.nextPages, r.stoppedBy?.code], [2, 3, true, '2-', 'stalled']);
+});
+
+test('makeFillable: the round limit has a stop code, and with zero fields it throws', async () => {
+  const r1 = round({ 'X-PDFops-Fields': '1', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' });
+  const r = await sequence([r1, r1]).client.makeFillable(PDF, { maxRounds: 2 });
+  assert.deepEqual([r.truncated, r.stoppedBy?.code], [true, 'max_rounds']);
+  const seq = sequence([nfBody({ truncated: true, nextPages: '2-' }), nfBody({ truncated: true, nextPages: '3-' })]);
+  await assert.rejects(seq.client.makeFillable(PDF, { maxRounds: 2 }), (e: unknown) => noFieldsErr(e, 'max_rounds', '3-'));
+});
+
+test('makeFillable: an error after prose-only rounds throws that error, not the original as a result', async () => {
+  const quota = () => new Response(JSON.stringify({ error: 'quota_exceeded', details: 'x' }), { status: 429 });
+  const { client } = sequence([nfBody({ truncated: true, nextPages: '41-' }), quota]);
+  await assert.rejects(client.makeFillable(PDF), (e: unknown) => e instanceof PdfOpsError && e.code === 'quota_exceeded');
+});
+
+test('makeFillable: a deadline skip is not final, a too_complex skip is', async () => {
+  const { client } = sequence([
+    round({ 'X-PDFops-Fields': '2', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-' }),
+    nfBody({ truncated: true, nextPages: '42-', pagesSkipped: [{ page: 42, reason: 'deadline' }, { page: 9, reason: 'too_complex' }] }),
+    round({ 'X-PDFops-Fields': '1' }),
+  ]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.count, r.truncated, r.pagesSkipped], [3, false, [9]]);
+});
+
+test('makeFillable: the final no_fields error carries earlier too_complex skips', async () => {
+  const { client } = sequence([nfBody({ truncated: true, nextPages: '2-', pagesSkipped: [{ page: 1, reason: 'too_complex' }] }), nfBody({})]);
+  await assert.rejects(
+    client.makeFillable(PDF),
+    (e: unknown) => e instanceof PdfOpsError && e.code === 'no_fields' && JSON.stringify(e.body?.pagesSkipped) === JSON.stringify([{ page: 1, reason: 'too_complex' }]),
+  );
+});
+
+test('makeFillable: a final no_fields after truncation clears truncatedBy and nextPages', async () => {
+  const { client } = sequence([
+    round({ 'X-PDFops-Fields': '3', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-', 'X-PDFops-Truncated-By': 'pages' }),
+    nfBody({}),
+  ]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.truncated, r.truncatedBy, r.nextPages], [false, [], undefined]);
+});
+
+test('makeFillable: no fields anywhere ends as the typed no_fields error', async () => {
+  const { client } = sequence([nfBody({ truncated: true, nextPages: '2-' }), nfBody({})]);
+  await assert.rejects(client.makeFillable(PDF), (e: unknown) => e instanceof PdfOpsError && e.code === 'no_fields');
+});
+
+test('makeFillable: a later error returns the partial result with stoppedBy; round 1 still throws', async () => {
+  const r1 = round({ 'X-PDFops-Fields': '200', 'X-PDFops-Field-Names': '["A"]', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '3-9' });
+  const quota = () => new Response(JSON.stringify({ error: 'quota_exceeded', details: 'monthly quota used' }), { status: 429 });
+  const r = await sequence([r1, quota]).client.makeFillable(PDF);
+  assert.deepEqual([r.count, r.names, r.truncated, r.nextPages], [200, ['A'], true, '3-9']);
+  assert.deepEqual(r.stoppedBy, { code: 'quota_exceeded', message: 'monthly quota used' });
+  assert.equal(r.pdf.length, OUT.length);
+  const net = () => {
+    throw new TypeError('fetch failed');
+  };
+  const n = await sequence([r1, net as never]).client.makeFillable(PDF);
+  assert.deepEqual([n.count, n.stoppedBy?.code, n.truncated], [200, 'network_error', true]);
+  await assert.rejects(sequence([net as never]).client.makeFillable(PDF), /fetch failed/);
+});
+
+test('makeFillable carries the first warning and the skipped pages from error bodies', async () => {
+  const { client } = sequence([
+    round({ 'X-PDFops-Fields': '1', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '2-9', 'x-pdfops-warning': 'xfa-first', 'X-PDFops-Truncated-By': 'pages' }),
+    round({ 'X-PDFops-Fields': '1', 'X-PDFops-Truncated': 'true', 'X-PDFops-Next-Pages': '5-9' }),
+    nfBody({ pagesSkipped: [{ page: 7, reason: 'too_complex' }] }),
+  ]);
+  const r = await client.makeFillable(PDF);
+  assert.deepEqual([r.warning, r.pagesSkipped, r.truncated, r.count], ['xfa-first', [7], false, 2]);
 });

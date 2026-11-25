@@ -76,6 +76,9 @@ Methods that return more than bytes use a result object, like `unlock()`. Header
 - `findText(pdf, 'Invoice', { regex: false, caseSensitive: false, wholeWord: true, maxHits: 100 })` returns hits with page and box. When `nextPage` is not null the scan stopped early; repeat with `pages` set to the page number plus a dash, e.g. `"6-"`.
 - `edit(pdf, items, { images })` stamps text, images and barcodes. `image` items name a key of `images`; a key is 1-64 characters of letters, digits, `_`, `.` or `-`, and not `pdf`, `items` or `password` (anything else throws before sending).
 - `addFields(pdf, fields)` creates form fields and returns `{ pdf, warning? }`.
+- `detectFields(pdf, { pages, maxPages, minConfidence })` suggests fields for a flat PDF and returns `{ count, truncated, nextPages?, fields }`; each entry can be passed to `addFields` as it is. It detects fields drawn as lines, boxes, underscores and checkboxes; review the result.
+- `detectFieldsPdf(pdf)` detects and adds in one call and returns `{ pdf, count, names, truncated, truncatedBy, nextPages?, pagesSkipped, warning? }`. With nothing found it throws `no_fields`.
+- `makeFillable(pdf, { maxRounds: 25 })` runs `detectFieldsPdf` and, while `truncated` is true, sends the result back with `pages` set to `nextPages`. Each round is one metered call. It continues past `no_fields` while pages are left; when the loop ends early you get a partial result (the PDF so far with `truncated: true`, `nextPages` and `stoppedBy` = `{ code, message }`; code is `stalled`, `max_rounds` or the API error code of the failed round) only if at least one field was added; otherwise it throws: `PdfOpsError` `no_fields` naming the stop (`stalled`, `max_rounds`) and the pages left in `body.nextPages`, or the failed round's own error unchanged.
 - `attach(pdf, files)` embeds files and returns `{ pdf, attachmentKeys }`.
 
 ```ts
@@ -106,6 +109,8 @@ const { pdf: form } = await pdfops.addFields(blankPdf, [
   { type: 'text', name: 'full_name', page: 1, x: 72, y: 600, width: 220, height: 20 },
   { type: 'checkbox', name: 'agree', page: 1, x: 72, y: 560, width: 14, height: 14 },
 ]);
+
+const { pdf: fillable, count } = await pdfops.makeFillable(flatPdf); // add fields to a flat PDF, then review them
 
 const { pdf: withXml, attachmentKeys } = await pdfops.attach(invoicePdf, [
   { data: xmlBytes, name: 'data.xml', mimeType: 'text/xml', relationship: 'Data' },
